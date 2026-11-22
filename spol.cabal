@@ -74,6 +74,7 @@ library
         text,
         mtl,
         vector,
+        containers,
     hs-source-dirs:     src
     default-language:   GHC2024
 

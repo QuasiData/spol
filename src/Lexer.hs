@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Lexer(Token(..), TokenKind(..), lexer) where
+module Lexer (Token (..), TokenKind (..), lexer) where
 
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
 import Data.Text (Text)
