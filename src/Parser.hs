@@ -1,46 +1,47 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Parser where
 
-import Control.Monad (unless, void, when)
-import Control.Monad.State (State, get, gets, modify', put)
-import Data.Functor (($>))
-import Data.List ((!?))
-import Data.Sequence (Seq, (|>))
-import Data.Sequence qualified as S
-import Data.Word (Word32)
 import Lexer
+
+import Control.Monad (void)
+import Control.Monad.ST (ST, runST)
+import Control.Monad.State (MonadState (put), StateT, get, gets, runStateT)
+import Data.Text (Text)
+import Data.Vector (Vector)
+import Data.Vector qualified as V
+import Data.Vector.Mutable (MVector)
+import Data.Vector.Mutable qualified as MV
+import Data.Word (Word32)
 
 data TreeKind
     = ErrorTree
-    | File
-    | Fn
-    | TypeExpr
-    | ParamList
-    | Param
-    | Block
-    | StmtLet
-    | StmtReturn
-    | StmtExpr
-    | ExprLiteral
-    | ExprName
-    | ExprParen
-    | ExprBinary
-    | ExprCall
-    | ArgList
-    | Arg
+    | FileTree
+    | FnTree
+    | TypeExprTree
+    | ParamListTree
+    | ParamTree
+    | BlockTree
+    | StmtLetTree
+    | StmtReturnTree
+    | StmtExprTree
+    | ExprLiteralTree
+    | ExprNameTree
+    | ExprParenTree
+    | ExprBinaryTree
+    | ExprCallTree
+    | ArgListTree
+    | ArgTree
     deriving (Show, Eq)
 
-data Tree = Tree
-    { treeKind :: TreeKind
-    , children :: [Child]
-    }
+data Tree = Tree TreeKind [Tree] | Leaf Token
     deriving (Show, Eq)
 
-data Child = ChildToken Token | ChildTree Tree
-    deriving (Show, Eq)
-
-data Event = Open {eventKind :: TreeKind} | Close | Advance
+data Event
+    = Open {eventKind :: TreeKind, forwardParent :: Maybe Int}
+    | Close
+    | Advance
     deriving (Show, Eq)
 
 data MarkOpened = MarkOpened {openIndex :: Int}
@@ -49,219 +50,107 @@ data MarkOpened = MarkOpened {openIndex :: Int}
 data MarkClosed = MarkClosed {closedIndex :: Int}
     deriving (Show, Eq)
 
-data ParserState = ParserState
-    { parserTokens :: [Token]
+data ParserState s = ParserState
+    { parserTokens :: !(Vector Token)
+    , parserCursor :: !Int
     , parserFuel :: !Word32
-    , parserEvents :: Seq Event
+    , parserEvents :: !(MVector s Event)
+    , parserEventCount :: !Int
     }
 
-type Parser a = State ParserState a
+type Parser s a = StateT (ParserState s) (ST s) a
 
-emit :: Event -> Parser Int
+emit :: Event -> Parser s Int
 emit event = do
     st <- get
-    let events = parserEvents st
-        i = S.length events
+    let buf = parserEvents st
+        n = parserEventCount st
 
-    put st{parserEvents = events |> event}
-    pure i
+    buf' <-
+        if n < MV.length buf
+            then pure buf
+            else MV.grow buf (max 1 (MV.length buf))
 
-open :: Parser MarkOpened
-open = MarkOpened <$> emit (Open ErrorTree)
+    MV.unsafeWrite buf' n event
+    put $! st{parserEvents = buf', parserEventCount = n + 1}
+    pure n
 
-openBefore :: MarkClosed -> Parser MarkOpened
+open :: Parser s MarkOpened
+open = do
+    MarkOpened <$> emit (Open ErrorTree Nothing)
+
+close :: MarkOpened -> TreeKind -> Parser s MarkClosed
+close (MarkOpened i) tk = do
+    buf <- gets parserEvents
+    event <- MV.read buf i
+
+    case event of
+        Open _ parent -> MV.write buf i (Open tk parent)
+        _ -> error "close: marker does not reference and Open event"
+
+    _ <- emit Close
+    pure (MarkClosed i)
+
+openBefore :: MarkClosed -> Parser s MarkOpened
 openBefore (MarkClosed i) = do
-    modify' $ \st -> st {parserEvents = S.insertAt i (Open ErrorTree) (parserEvents st)}
-    pure (MarkOpened i)
+    mark@(MarkOpened j) <- open
 
-close :: MarkOpened -> TreeKind -> Parser MarkClosed
-close mark tk = do
-    modify' $ \st -> st{parserEvents = S.update (openIndex mark) (Open tk) (parserEvents st)}
+    buf <- gets parserEvents
+    event <- MV.read buf i
+
+    case event of
+        Open tk Nothing -> MV.write buf i (Open tk (Just j))
+        _ -> error "openBefore: invalid marker"
+
+    pure mark
+
+nth :: Int -> Parser s TokenKind
+nth = undefined -- Decrement fuel
+
+at :: TokenKind -> Parser s Bool
+at = undefined
+
+atAny :: [TokenKind] -> Parser s Bool
+atAny = undefined
+
+eof :: Parser s Bool
+eof = undefined
+
+advance :: Parser s ()
+advance = undefined -- Reset fuel
+
+eat :: TokenKind -> Parser s Bool
+eat = undefined
+
+expect :: TokenKind -> Parser s ()
+expect = undefined
+
+reportError :: Text -> Parser s ()
+reportError = undefined
+
+advanceWithError :: Text -> Parser s ()
+advanceWithError = undefined
+
+parseFile :: Parser s ()
+parseFile = do
     void $ emit Close
-    pure $ MarkClosed (openIndex mark)
 
-advance :: Parser ()
-advance = do
-    tokens <- gets parserTokens
-    case tokens of
-        [] -> error "Called advance on parser with empty tokens"
-        _ : ts -> do
-            void $ emit Advance
-            modify' $ \st -> st{parserTokens = ts, parserFuel = 256}
+buildTree :: Vector Token -> Vector Event -> Tree
+buildTree = undefined
 
-withNode :: TreeKind -> Parser a -> Parser a
-withNode tk parser = do
-    mark <- open
-    result <- parser
-    _ <- close mark tk
-    pure result
+parseTest :: (forall s. Parser s a) -> Text -> Vector Event
+parseTest parser input = runST $ do
+    buffer <- MV.new 128
+    let initial =
+            ParserState
+                { parserTokens = tokens
+                , parserCursor = 0
+                , parserFuel = 256
+                , parserEvents = buffer
+                , parserEventCount = 0
+                }
 
-withClosedNode :: TreeKind -> Parser () -> Parser MarkClosed
-withClosedNode tk p = do
-    m <- open
-    p
-    close m tk
-
-eof :: Parser Bool
-eof = gets (null . parserTokens)
-
-nth :: Int -> Parser TokenKind
-nth lookahead = do
-    st <- get
-    when (parserFuel st <= 0) $
-        error "Parser ran out of fuel"
-
-    modify' $ \s -> s{parserFuel = parserFuel s - 1}
-    pure $ maybe Eof tokenKind (parserTokens st !? lookahead)
-
-at :: TokenKind -> Parser Bool
-at tk = (== tk) <$> nth 0
-
-eat :: TokenKind -> Parser Bool
-eat tk = do
-    found <- at tk
-    when found advance
-    pure found
-
-expect :: TokenKind -> Parser ()
-expect tk = do
-    b <- eat tk
-    if b
-        then pure ()
-        -- TODO: add proper error reporting
-        else do
-            pure ()
-
-advanceWithError :: String -> Parser ()
-advanceWithError _ = withNode ErrorTree advance
-
--- TODO: proper error report
-
-untilM_ :: (Monad m) => m Bool -> m () -> m ()
-untilM_ condition action = do
-    done <- condition
-    unless done $ do
-        action
-        untilM_ condition action
-
-parseFile :: Parser ()
-parseFile =
-    withNode File $
-        untilM_ eof parseItem
-
-parseItem :: Parser ()
-parseItem = do
-    isFn <- at FnKeyword
-    if isFn
-        then parseFunc
-        else advanceWithError "Expected a function"
-
-parseFunc :: Parser ()
-parseFunc = withNode Fn $ do
-    expect FnKeyword
-    expect Name
-
-    lparen <- at LParen
-    when lparen $ do
-        parseParamList
-
-    arrow <- eat Arrow
-    when arrow $ do
-        parseTypeExpr
-
-    lcurly <- at LCurly
-    when lcurly $ do
-        parseBlock
-
-parseParamList :: Parser ()
-parseParamList = withNode ParamList $ do
-    expect LParen
-    go
-    expect RParen
+    (_, final) <- runStateT parser initial
+    V.freeze $ MV.slice 0 (parserEventCount final) (parserEvents final)
   where
-    go = do
-        closing <- at RParen
-        end <- eof
-
-        unless (closing || end) $ do
-            atName <- at Name
-            when atName $ do
-                parseParam
-                go
-
-parseParam :: Parser ()
-parseParam = withNode Param $ do
-    expect Name
-    expect Colon
-    parseTypeExpr
-    atRParen <- at RParen
-    unless atRParen $ do
-        expect Comma
-
-parseTypeExpr :: Parser ()
-parseTypeExpr = withNode TypeExpr (expect Name)
-
-parseBlock :: Parser ()
-parseBlock = withNode Block $ do
-    expect LCurly
-    go
-    expect RCurly
-  where
-    go = do
-        closing <- at RCurly
-        end <- eof
-
-        unless (closing || end) $ do
-            next <- nth 0
-            case next of
-                LetKeyword -> parseStmtLet
-                ReturnKeyword -> parseStmtReturn
-                _ -> parseStmtExpr
-            go
-
-parseStmtLet :: Parser ()
-parseStmtLet = withNode StmtLet $ do
-    expect LetKeyword
-    expect Name
-    expect Eq
-    parseExpr
-    expect Semi
-
-parseStmtReturn :: Parser ()
-parseStmtReturn = withNode StmtReturn $ do
-    expect ReturnKeyword
-    parseExpr
-    expect Semi
-
-parseStmtExpr :: Parser ()
-parseStmtExpr = withNode StmtExpr $ do
-    parseExpr
-    expect Semi
-
-parseExpr :: Parser ()
-parseExpr = do undefined
-        
-
-parseExprDelimited :: Parser MarkClosed
-parseExprDelimited = do
-    mark <- open
-    next <- nth 0
-    tk <- case next of
-        tk
-            | tk `elem` [Int, TrueKeyword, FalseKeyword] ->
-                advance $> ExprLiteral
-        Name -> advance $> ExprName
-        LParen -> do
-            advance
-            parseExpr
-            expect RParen
-            pure ExprParen
-        _ -> do
-            end <- eof
-            unless end advance
-            pure ErrorTree
-
-    close mark tk
-
-buildTree :: [Token] -> [Event] -> Tree
-buildTree ps = undefined
+    tokens = lexer input
