@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Lexer (Token (..), TokenKind (..), lexer) where
+module Lexer (Token (..), TokenKind (..), isTrivia, lexer) where
 
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
 import Data.Text (Text)
@@ -51,6 +51,11 @@ nameOrKeyword _ = NameToken
 
 isNameCont :: Char -> Bool
 isNameCont c = isAlphaNum c || (c == '_')
+
+isTrivia :: TokenKind -> Bool
+isTrivia WhiteSpaceToken = True
+isTrivia CommentToken = True
+isTrivia _ = False
 
 lexer :: Text -> Vector Token
 lexer input = V.fromList $ reverse $ go input []
