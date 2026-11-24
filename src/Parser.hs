@@ -39,9 +39,6 @@ data TreeKind
     | ArgTree
     deriving (Show, Eq)
 
-data Tree = Tree TreeKind [Tree] | Leaf Token | ErrorNode String
-    deriving (Show, Eq)
-
 data Event
     = Open {eventKind :: TreeKind, forwardParent :: Maybe Int}
     | Close
@@ -404,6 +401,26 @@ parseArg = withNode ArgTree $ do
     parseExpr
     whenM (not <$> at RParenToken) (expect CommaToken)
 
+data GreenTree = GreenNodeElem !GreenNode | GreenTokenElem !GreenToken
+    deriving (Show)
+
+data GreenNode = GreenNode
+    { greenNodeKind :: !TreeKind
+    , greenNodeWidth :: Int
+    , greenNodeChildren :: !(Vector GreenTree)
+    }
+    deriving (Show)
+
+data GreenToken = GreenToken
+    { greenTokenKind :: !TokenKind
+    , greenTokenText :: !Text
+    , greenTokenWidth :: !Int
+    }
+    deriving (Show)
+
+data Tree = Tree TreeKind [Tree] | Leaf Token | ErrorNode String
+    deriving (Show, Eq)
+
 data BuildFrame = BuildFrame TreeKind [Tree]
 
 data BuildState = BuildState
@@ -418,8 +435,12 @@ buildTree tokens events = finished $ V.ifoldl' step initial events
   where
     initial = BuildState [] 0 IS.empty Nothing
 
+    collectTrivia i = V.map Leaf $ V.takeWhile (isTrivia . tokenKind) (V.drop i tokens)
+
     finished st = case st of
-        BuildState [] _ _ (Just tree) -> tree
+        BuildState [] i _ (Just (Tree tk children)) ->
+            let trailingWhiteSpace = V.toList $ collectTrivia i
+             in Tree tk (children ++ trailingWhiteSpace)
         BuildState [] _ _ Nothing -> error "buildTree: no root node, this is a bug"
         _ -> error "buildTree: unclosed nodes, this is a bug"
 
@@ -441,16 +462,19 @@ buildTree tokens events = finished $ V.ifoldl' step initial events
          in st{buildFrames = frames, buildSkipped = IS.union skipped (buildSkipped st)}
 
     advanceNode st =
-        case tokens V.!? (buildTokenIndex st) of
-            Just token ->
-                case buildFrames st of
-                    (BuildFrame tk children : rest) ->
-                        st
-                            { buildFrames = BuildFrame tk (Leaf token : children) : rest
-                            , buildTokenIndex = buildTokenIndex st + 1
-                            }
-                    [] -> error "buildTree: not open tree, this is a bug"
-            Nothing -> error "buildTree: token index out of range, this is a bug"
+        let i = buildTokenIndex st
+            leadingTrivia = collectTrivia i
+            j = i + V.length leadingTrivia
+         in case tokens V.!? j of
+                Just token ->
+                    case buildFrames st of
+                        (BuildFrame tk children : rest) ->
+                            st
+                                { buildFrames = BuildFrame tk (Leaf token : (reverse (V.toList leadingTrivia) ++ children)) : rest
+                                , buildTokenIndex = j + 1
+                                }
+                        [] -> error "buildTree: not open tree, this is a bug"
+                Nothing -> error "buildTree: token index out of range, this is a bug"
 
     errorNode st err =
         case buildFrames st of
@@ -495,7 +519,7 @@ parseFileTest path = do
     putStr $ prettyPrintTree tree
 
 parseTest :: (forall s. Parser s a) -> Text -> Tree
-parseTest parser input = buildTree tokens $ runST $ do
+parseTest parser input = buildTree allTokens $ runST $ do
     buffer <- MV.new 128
     let initial =
             ParserState
@@ -509,4 +533,5 @@ parseTest parser input = buildTree tokens $ runST $ do
     (_, final) <- runStateT parser initial
     V.freeze $ MV.slice 0 (parserEventCount final) (parserEvents final)
   where
-    tokens = V.filter (not . isTrivia . tokenKind) (lexer input)
+    tokens = V.filter (not . isTrivia . tokenKind) allTokens
+    allTokens = lexer input
