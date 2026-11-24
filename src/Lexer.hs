@@ -88,7 +88,7 @@ lexer input = V.fromList $ reverse $ go input []
                 let (digit, rest') = T.span isDigit txt
                  in push IntToken digit rest' tokens
             | otherwise -> error "hello"
-        Nothing -> (Token EofToken "") : tokens
+        Nothing -> tokens
 
     push kind lexeme rest tokens =
         go rest (Token kind lexeme : tokens)

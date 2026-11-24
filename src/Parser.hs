@@ -8,10 +8,12 @@ import Lexer
 import Control.Monad (forM_, unless, void, when)
 import Control.Monad.ST (ST, runST)
 import Control.Monad.State (MonadState (put), StateT, get, gets, modify', runStateT)
+import Data.ByteString qualified as BS
 import Data.IntSet qualified as IS
 import Data.List (findIndex)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Tree qualified as TR
 import Data.Vector (Vector)
 import Data.Vector qualified as V
@@ -421,28 +423,76 @@ data GreenToken = GreenToken
 data Tree = Tree TreeKind [Tree] | Leaf Token | ErrorNode String
     deriving (Show, Eq)
 
-data BuildFrame = BuildFrame TreeKind [Tree]
+treeWidth :: GreenTree -> Int
+treeWidth (GreenNodeElem node) = greenNodeWidth node
+treeWidth (GreenTokenElem token) = greenTokenWidth token
+
+tokensWidth :: Vector Token -> Int
+tokensWidth = V.foldl' (\acc token -> acc + tokenWidth token) 0
+
+tokenWidth :: Token -> Int
+tokenWidth = BS.length . TE.encodeUtf8 . tokenText
+
+tokenToGreenTree :: Token -> GreenTree
+tokenToGreenTree token = GreenTokenElem (GreenToken (tokenKind token) (tokenText token) (tokenWidth token))
+
+data ParseError = ParseError
+    { parseErrorOffset :: !Int
+    , parseErrorMessage :: !String
+    }
+    deriving (Show)
+
+data ParseResult = ParseResult
+    { parseRoot :: !GreenNode
+    , parseErrors :: !(Vector ParseError)
+    }
+    deriving (Show)
+
+data BuildFrame = BuildFrame
+    { frameKind :: !TreeKind
+    , frameChildren :: ![GreenTree]
+    }
 
 data BuildState = BuildState
     { buildFrames :: [BuildFrame]
     , buildTokenIndex :: !Int
+    , buildByteOffset :: !Int
     , buildSkipped :: !IS.IntSet
-    , buildRoot :: Maybe Tree
+    , buildErrors :: ![ParseError]
+    , buildRoot :: Maybe GreenNode
     }
 
-buildTree :: Vector Token -> Vector Event -> Tree
+buildTree :: Vector Token -> Vector Event -> ParseResult
 buildTree tokens events = finished $ V.ifoldl' step initial events
   where
-    initial = BuildState [] 0 IS.empty Nothing
+    initial = BuildState [] 0 0 IS.empty [] Nothing
 
-    collectTrivia i = V.map Leaf $ V.takeWhile (isTrivia . tokenKind) (V.drop i tokens)
+    collectTrivia i = V.takeWhile (isTrivia . tokenKind) (V.drop i tokens)
 
-    finished st = case st of
-        BuildState [] i _ (Just (Tree tk children)) ->
-            let trailingWhiteSpace = V.toList $ collectTrivia i
-             in Tree tk (children ++ trailingWhiteSpace)
-        BuildState [] _ _ Nothing -> error "buildTree: no root node, this is a bug"
-        _ -> error "buildTree: unclosed nodes, this is a bug"
+    tokensToTree t = V.map tokenToGreenTree t
+
+    makeNode :: TreeKind -> [GreenTree] -> GreenNode
+    makeNode tk reversedChildren =
+        let children = V.fromList (reverse reversedChildren)
+            width = V.foldl' (\acc child -> acc + treeWidth child) 0 children
+         in GreenNode tk width children
+
+    finished st =
+        case (buildFrames st, buildRoot st) of
+            ([], Just root) ->
+                let remain = V.drop (buildTokenIndex st) tokens
+                 in if V.all (isTrivia . tokenKind) remain
+                        then
+                            let trailing = V.map tokenToGreenTree remain
+                                root' =
+                                    root
+                                        { greenNodeChildren = greenNodeChildren root V.++ trailing
+                                        , greenNodeWidth = greenNodeWidth root + tokensWidth remain
+                                        }
+                             in ParseResult{parseRoot = root', parseErrors = V.fromList (reverse (buildErrors st))}
+                        else error "buildTree: unconsumed non-trivia tokens, this is a bug"
+            ([], Nothing) -> error "buildTree: no root node, this is a bug"
+            _ -> error "buildTree: unclosed nodes, this is a bug"
 
     step st i event
         | IS.member i (buildSkipped st) = st
@@ -450,7 +500,7 @@ buildTree tokens events = finished $ V.ifoldl' step initial events
             Open{} -> openNode st i
             Advance -> advanceNode st
             Close -> closeNode st
-            Error err -> errorNode st err
+            Error err -> recordError st err
 
     openNode st i =
         let (tks, skipped) = followForwardPointers i
@@ -469,30 +519,34 @@ buildTree tokens events = finished $ V.ifoldl' step initial events
                 Just token ->
                     case buildFrames st of
                         (BuildFrame tk children : rest) ->
-                            st
-                                { buildFrames = BuildFrame tk (Leaf token : (reverse (V.toList leadingTrivia) ++ children)) : rest
-                                , buildTokenIndex = j + 1
-                                }
+                            let leading = V.toList $ tokensToTree leadingTrivia
+                                current = tokenToGreenTree token
+                                consumedWidth = tokensWidth leadingTrivia + tokenWidth token
+                             in st
+                                    { buildFrames = BuildFrame tk (current : reverse leading ++ children) : rest
+                                    , buildTokenIndex = j + 1
+                                    , buildByteOffset = buildByteOffset st + consumedWidth
+                                    }
                         [] -> error "buildTree: not open tree, this is a bug"
                 Nothing -> error "buildTree: token index out of range, this is a bug"
 
-    errorNode st err =
-        case buildFrames st of
-            (BuildFrame tk children : rest) ->
-                st{buildFrames = BuildFrame tk (ErrorNode err : children) : rest}
-            [] -> error "buildTree: not open tree, this is a bug"
+    recordError st err =
+        let trivia = collectTrivia (buildTokenIndex st)
+            offset = buildByteOffset st + tokensWidth trivia
+            diagnostic = ParseError offset err
+         in st{buildErrors = diagnostic : buildErrors st}
 
     closeNode st =
         case buildFrames st of
-            [] -> error "buildTree: no nodes to close, this is a bug"
             BuildFrame tk children : rest ->
-                let tree = Tree tk (reverse children)
+                let node = makeNode tk children
                  in case rest of
                         BuildFrame parent siblings : ancestors ->
-                            st{buildFrames = BuildFrame parent (tree : siblings) : ancestors}
+                            st{buildFrames = BuildFrame parent (GreenNodeElem node : siblings) : ancestors}
                         [] -> case buildRoot st of
-                            Nothing -> st{buildFrames = [], buildRoot = Just tree}
+                            Nothing -> st{buildFrames = [], buildRoot = Just node}
                             Just _ -> error "buildTree: multiple root nodes, this is a bug"
+            [] -> error "buildTree: no nodes to close, this is a bug"
 
     followForwardPointers start = go start [] IS.empty
       where
@@ -505,20 +559,23 @@ buildTree tokens events = finished $ V.ifoldl' step initial events
                         | otherwise -> error "buildTree: forwardParent points back, this is a bug"
                 _ -> error "buildTree: not an open event, this is a bug"
 
-prettyPrintTree :: Tree -> String
-prettyPrintTree = TR.drawTree . convert
+prettyPrintTree :: GreenNode -> String
+prettyPrintTree = TR.drawTree . convertNode
   where
-    convert (Leaf token) = TR.Node (show token) []
-    convert (Tree tk children) = TR.Node (show tk) (map convert children)
-    convert (ErrorNode err) = TR.Node err []
+    convertNode node = TR.Node (show (greenNodeKind node)) (map convertTree (V.toList (greenNodeChildren node)))
+    convertTree (GreenNodeElem node) = convertNode node
+    convertTree (GreenTokenElem token) = TR.Node (show (greenTokenKind token) ++ " " ++ show (greenTokenText token)) []
 
 parseFileTest :: String -> IO ()
 parseFileTest path = do
     input <- readFile path
-    let tree = parseTest parseFile (T.pack input)
-    putStr $ prettyPrintTree tree
+    let res = parseTest parseFile (T.pack input)
+    putStr $ prettyPrintTree (parseRoot res)
 
-parseTest :: (forall s. Parser s a) -> Text -> Tree
+    forM_ (parseErrors res) $ \err ->
+        putStrLn $ "Error at byte " ++ show (parseErrorOffset err) ++ ": " ++ parseErrorMessage err
+
+parseTest :: (forall s. Parser s a) -> Text -> ParseResult
 parseTest parser input = buildTree allTokens $ runST $ do
     buffer <- MV.new 128
     let initial =
